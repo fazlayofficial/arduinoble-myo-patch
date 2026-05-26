@@ -1,0 +1,16 @@
+--- a/src/remote/BLERemoteDescriptor.cpp
++++ b/src/remote/BLERemoteDescriptor.cpp
+@@ -52,7 +52,12 @@ int BLERemoteDescriptor::writeValue(const uint8_t value[], int length)
+   memcpy(_value, value, length);
+   _valueLength = length;
+
+-  ATT.writeReq(_connectionHandle, _handle, value, length);
++  // PATCH: writeCmd (write-without-response) instead of writeReq
++  // writeReq blocks waiting for ATT_WRITE_RSP. When the Myo is streaming
++  // 250+ notifications/sec those fill the ATT slot and the response never
++  // arrives, causing subscribe() and every keepalive to silently fail.
++  // writeCmd fires and returns immediately — no blocking, no deadlock.
++  ATT.writeCmd(_connectionHandle, _handle, value, length);
+
+   return 1;
+ }
