@@ -5,48 +5,65 @@
 
 ---
 
-## The Problem
+## Why this matters
 
-You have successfully connected your Arduino Nano 33 BLE (or any nRF52840 board) to a Myo armband. The device is paired. Subscription calls return without error. And yet — **no EMG data ever arrives**.
+Millions of people worldwide depend on assistive devices — prosthetic limbs, powered wheelchairs, rehabilitation systems — that could be controlled by muscle signals (EMG). The **Myo armband** is the most accessible 8-channel wireless EMG sensor available to researchers, available secondhand for under $60. The **Arduino Nano 33 BLE** costs $25 and runs a full neural network on-chip.
 
-The root cause is a single wrong ATT opcode deep inside ArduinoBLE.
+Together, they should enable a fully standalone, PC-free assistive control system that costs under $100.
 
-### How Myo EMG activation works
+**They couldn't talk to each other. This patch fixes that.**
 
-To receive EMG notifications from the Myo, the BLE Central must write `0x0100` to each EMG characteristic's **CCCD descriptor** (UUID `0x2902`). This is standard BLE subscription — nothing unusual so far.
+Without it, every attempt to stream Myo EMG data to a bare-metal Arduino hits the same invisible wall:
 
-The problem is *how* that write is issued. The Myo's GATT stack requires a BLE ATT **Write Command** — opcode `0x52`, *write-without-response*. It does **not** implement ATT Write Response (`0x13`) for this descriptor.
+- You connect successfully ✓
+- You discover services and characteristics ✓
+- You call `subscribe()` ✓
+- You receive **zero data** — no error, no timeout, just silence ✗
 
-ArduinoBLE v1.3.x routes **all** CCCD writes through `ATT.writeReq()` — a **Write Request** (opcode `0x12`) that blocks indefinitely waiting for a Write Response that the Myo will never send.
+This has blocked embedded Myo research for years. Every published Myo paper routes through a PC, laptop, phone, or Raspberry Pi — not because researchers wanted that complexity, but because bare-metal BLE was silently broken. **This is the first documented fix.**
+
+---
+
+## Visual overview
+
+![BLE ATT opcode diagram](docs/ble_patch_diagram.png)
+
+> Left: why stock ArduinoBLE hangs forever waiting for a response the Myo never sends.  
+> Right: what the patch does — fires and returns immediately.  
+> Full technical analysis: [`docs/TECHNICAL_NOTES.md`](docs/TECHNICAL_NOTES.md)
+
+---
+
+## The problem
+
+The Myo's GATT stack requires a BLE ATT **Write Command** (opcode `0x52`, write-without-response) to activate EMG notifications. It does **not** implement ATT Write Response (`0x13`) for its CCCD descriptors.
+
+ArduinoBLE v1.3.x routes all CCCD writes through `ATT.writeReq()` — a blocking **Write Request** (opcode `0x12`) that waits indefinitely for a response that never comes.
 
 ```
 BLE Central                         Myo Peripheral
      │                                    │
      │── ATT_WRITE_REQ (0x12) ──────────►│  ← ArduinoBLE sends this
-     │                                    │    Myo ignores / does not respond
-     │◄ [waiting for ATT_WRITE_RSP] ──────│  ← This response never comes
+     │                                    │    Myo does not respond
+     │◄─ [waiting for ATT_WRITE_RSP] ─────│  ← never arrives
      │        ⏳ blocks forever           │
-     │                                    │  ← No subscription confirmed
-     │                                    │  ← No notifications ever sent
+     │                                    │  ← no subscription confirmed
+     │                                    │  ← zero notifications ever sent
 ```
-
-The function hangs. The subscription is never confirmed. Zero notifications arrive. Ever.
 
 ---
 
-## The Fix
+## The fix
 
 One line in `ArduinoBLE/src/remote/BLERemoteDescriptor.cpp`, inside `writeValue()`:
 
 ```cpp
-// BEFORE — blocks permanently on Myo (waits for ATT_WRITE_RSP that never comes):
+// BEFORE — blocks permanently (waits for ATT_WRITE_RSP that never comes):
 ATT.writeReq(_connectionHandle, _handle, value, length);
 
 // AFTER — write-without-response, fires and returns immediately:
 ATT.writeCmd(_connectionHandle, _handle, value, length);
 ```
-
-`ATT.writeCmd()` issues opcode `0x52` — a Write Command. It requires no response, returns immediately, and is exactly what the Myo expects.
 
 ---
 
@@ -62,58 +79,36 @@ cp patch/BLERemoteDescriptor.cpp "%USERPROFILE%\Documents\Arduino\libraries\Ardu
 cp patch/BLERemoteDescriptor.cpp ~/Arduino/libraries/ArduinoBLE/src/remote/BLERemoteDescriptor.cpp
 ```
 
-Then recompile your sketch. No other changes needed.
+Recompile your sketch. No other changes needed.
 
 ### Option B — Apply the diff manually
 
-Edit `ArduinoBLE/src/remote/BLERemoteDescriptor.cpp` and find `writeValue()`. Replace the `ATT.writeReq(...)` call with `ATT.writeCmd(...)`. The rest of the file is unchanged.
+Edit `ArduinoBLE/src/remote/BLERemoteDescriptor.cpp`, find `writeValue()`, replace `ATT.writeReq(...)` with `ATT.writeCmd(...)`. One word change. Everything else stays identical.
 
 ---
 
 ## Why `writeCmd` is safe here
 
-`ATT.writeReq()` is appropriate when the peripheral confirms receipt (e.g., writing a configuration register on a sensor that acknowledges writes). For CCCD subscription on the Myo, the armband silently activates the stream — it does not send a Write Response. Using `writeCmd` matches the Myo's actual ATT implementation.
-
-**Impact on other devices:** `writeCmd` is valid per the BLE specification for any peripheral that supports it. For peripherals that *require* a Write Response, `writeCmd` may not guarantee delivery on noisy channels — but CCCD descriptors on consumer BLE devices almost universally support write-without-response.
-
-If you need strict compatibility with both device classes, the safer production fix is to detect the peripheral type and route accordingly. For Myo-specific deployments, this single substitution is sufficient.
+`ATT.writeReq()` is correct when the peripheral confirms receipt. For Myo CCCD subscription, the armband silently activates the stream without sending a Write Response — `writeCmd` matches its actual ATT implementation exactly.
 
 ---
 
-## Background: Why this was never fixed upstream
+## Why this was never fixed upstream
 
-Every prior Myo-based research system — without exception — uses an **OS-level BLE host stack**:
+Every prior Myo system uses an OS-level BLE stack:
 
-| Platform | BLE Stack | Handles opcode routing? |
+| Platform | BLE Stack | Handles this transparently? |
 |---|---|---|
 | Linux | BlueZ | ✓ Kernel-managed |
 | Windows | WinBLE | ✓ Kernel-managed |
 | macOS / iOS | CoreBluetooth | ✓ Kernel-managed |
 | Android | Android BLE API | ✓ Kernel-managed |
 | Raspberry Pi | BlueZ | ✓ Kernel-managed |
+| **Arduino (bare metal)** | **ArduinoBLE** | **✗ Hangs** |
 
-These stacks absorb the Myo's ATT quirks transparently. Application code calls `subscribe()` and data flows — the correct opcode is handled internally.
+OS stacks absorb the Myo's ATT quirk transparently. ArduinoBLE on bare metal does not — and until now, no one had documented why.
 
-ArduinoBLE is a **userspace BLE implementation** running on bare metal. It has no kernel buffer, no interrupt-driven notification queue, and no abstraction over the write opcode. When `writeReq` hangs, the entire firmware hangs with it.
-
-**To our knowledge, this is the first documented solution enabling native Myo EMG streaming on a bare-metal MCU.** The issue has been reported (ArduinoBLE #71) but was not resolved in the library.
-
----
-
-## Scope of this patch
-
-This repository contains **only** the library fix:
-
-```
-arduinoble-myo-patch/
-├── README.md                    ← This file
-├── patch/
-│   └── BLERemoteDescriptor.cpp  ← Patched ArduinoBLE file
-└── docs/
-    └── TECHNICAL_NOTES.md       ← ATT opcode reference and deeper analysis
-```
-
-This patch is extracted from a larger research project on adaptive TinyML-based sEMG gesture recognition for wheelchair control. That project's full firmware, data pipeline, and model are maintained separately.
+Related upstream issue: [ArduinoBLE #71](https://github.com/arduino-libraries/ArduinoBLE/issues/71)
 
 ---
 
@@ -128,26 +123,26 @@ This patch is extracted from a larger research project on adaptive TinyML-based 
 
 ---
 
-## Related issue
+## Repository structure
 
-[ArduinoBLE GitHub Issue #71](https://github.com/arduino-libraries/ArduinoBLE/issues/71) — `writeValue()` on remote descriptors blocks indefinitely on devices that do not send Write Response.
+```
+arduinoble-myo-patch/
+├── README.md
+├── LICENSE                          ← MIT
+├── CHANGELOG.md
+├── patch/
+│   ├── BLERemoteDescriptor.cpp      ← Patched ArduinoBLE file
+│   └── arduinoble_myo_cccd.patch    ← Unified diff for git apply
+└── docs/
+    ├── TECHNICAL_NOTES.md           ← Deep ATT opcode analysis
+    └── ble_patch_diagram.png        ← Visual overview (add after generating)
+```
 
 ---
 
-## Citation
+## License
 
-If this patch saves you days of debugging, please cite:
-
-```bibtex
-@misc{rabby2025arduinoble,
-  title        = {ArduinoBLE Myo Patch: ATT Write Command Fix for Bare-Metal EMG Streaming},
-  author       = {Rabby, Fazlay},
-  year         = {2025},
-  howpublished = {\url{https://github.com/fazlayofficial/arduinoble-myo-patch}},
-  note         = {Enables native Myo BLE EMG streaming on Arduino Nano 33 / nRF52840 
-                  by replacing ATT.writeReq() with ATT.writeCmd() in BLERemoteDescriptor.cpp}
-}
-```
+Released under the **MIT License** — see [`LICENSE`](LICENSE) for full terms.
 
 ---
 
